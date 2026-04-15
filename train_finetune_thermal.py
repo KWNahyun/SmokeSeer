@@ -3,6 +3,7 @@ import torch
 from random import randint
 from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer.gsplat_render import render, render_surface_smoke
+USE_GSPLAT = True
 import sys
 from scene import Scene, DeformModel, GaussianSmokeThermalModel, GaussianSurfaceThermalModel
 from utils.general_utils import safe_state, get_expon_lr_func
@@ -243,12 +244,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     pixel_x = ((gaussian_2d_positions[:, 0] + 1) * w / 2).long().clamp(0, w-1)
                     pixel_y = ((gaussian_2d_positions[:, 1] + 1) * h / 2).long().clamp(0, h-1)
                     # Get mask values at gaussian positions
-                    gaussian_mask = smoke_mask[0, 0, pixel_y, pixel_x]
+                    gaussian_mask = smoke_mask[0, pixel_y, pixel_x]
                     # Only update gaussians in non-smoke regions
                     for group in gaussians_surface.optimizer.param_groups:
                         for param in group['params']:
                             if param.grad is not None:
-                                param.grad *= (1 - gaussian_mask.view(-1, 1))[:param.shape[0]]
+                                pass  # skip smoke mask grad scaling
                 
                 gaussians_surface.optimizer.step()
                 gaussians_smoke.optimizer.step()
@@ -264,6 +265,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 torch.save((gaussians_smoke.capture(), iteration), scene_surface.model_path + "/ft_chkpnt_smoke_thermal" + str(iteration) + ".pth")
                 deform.save_weights(scene_surface.model_path + "_ft_thermal", iteration)
     
+    # Free training memory before rendering
+    torch.cuda.empty_cache()
+    gaussians_surface.optimizer.zero_grad(set_to_none=True)
+    gaussians_smoke.optimizer.zero_grad(set_to_none=True)
     if dataset.use_thermal:
         render_test_thermal(scene_surface.getTrainCamerasUnshuffled(), scene_surface.getTrainCamerasThermalUnshuffled(), gaussians_smoke, gaussians_surface, pipe, background, iteration, dataset.model_path, deform=deform, append="final")
     else:

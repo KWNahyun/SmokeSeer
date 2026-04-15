@@ -18,7 +18,7 @@ from sklearn.preprocessing import StandardScaler
 import pdb
 from scene import Scene, DeformModel, GaussianModel
 from os import makedirs
-from gaussian_renderer import render, render_surface_smoke
+from gaussian_renderer.gsplat_render import render, render_surface_smoke
 from utils.general_utils import safe_state
 from argparse import ArgumentParser
 from arguments import ModelParams, PipelineParams, get_combined_args
@@ -126,6 +126,7 @@ def render_test_thermal(test_cameras, test_cameras_thermal, gaussians_smoke, gau
             time_input = view.fid.unsqueeze(0).expand(N, -1)
             d_xyz, d_rotation, d_scaling, d_opacity, d_color = deform.step(gaussians_smoke.get_xyz.detach(), time_input)
             deform_parameters = [d_xyz, d_rotation, d_scaling, d_opacity, d_color]
+            torch.cuda.empty_cache()
             rendering = render_surface_smoke(view, gaussians_surface, gaussians_smoke, pipe, background, deform_parameters=deform_parameters)["render"].clamp(0.0, 1.0)
             render_surface = render(view, gaussians_surface, pipe, background)["render"].clamp(0.0, 1.0)
             render_smoke = render(view, gaussians_smoke, pipe, background, deform_parameters=deform_parameters)["render"].clamp(0.0, 1.0)

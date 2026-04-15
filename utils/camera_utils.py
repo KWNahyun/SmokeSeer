@@ -10,6 +10,7 @@
 #
 
 from scene.cameras import Camera
+from PIL import Image
 import numpy as np
 from utils.general_utils import PILtoTorch
 from utils.graphics_utils import fov2focal
@@ -33,6 +34,8 @@ def smooth_binary_mask(binary_mask):
     return smoothed_mask
 
 def loadCam(args, id, cam_info, resolution_scale):
+    if isinstance(cam_info.image, str):
+        cam_info = cam_info._replace(image=Image.open(cam_info.image))
     orig_w, orig_h = cam_info.image.size
 
     if args.resolution in [1, 2, 4, 8]:
@@ -54,6 +57,10 @@ def loadCam(args, id, cam_info, resolution_scale):
         scale = float(global_down) * float(resolution_scale)
         resolution = (int(orig_w / scale), int(orig_h / scale))
 
+    if isinstance(cam_info.gt_desmoked_image, str):
+        cam_info = cam_info._replace(gt_desmoked_image=Image.open(cam_info.gt_desmoked_image))
+    if isinstance(cam_info.alpha_mask, str):
+        cam_info = cam_info._replace(alpha_mask=Image.open(cam_info.alpha_mask))
     resized_image_rgb = PILtoTorch(cam_info.image, resolution)
     if cam_info.gt_desmoked_image is not None:
         resized_image_gt_RGB = PILtoTorch(cam_info.gt_desmoked_image, resolution)
@@ -82,7 +89,11 @@ def loadCam(args, id, cam_info, resolution_scale):
 
     if cam_info.depth_path != "" and cam_info.depth_path is not None:
         try:
-            invdepthmap = cv2.imread(cam_info.depth_path, -1).astype(np.float32) / float(2**16)
+            _depth_raw = cv2.imread(cam_info.depth_path, -1)
+            if _depth_raw is None:
+                invdepthmap = None
+            else:
+                invdepthmap = _depth_raw.astype(np.float32) / float(2**16)
         except FileNotFoundError:
             print(f"Error: The depth file at path '{cam_info.depth_path}' was not found.")
             raise

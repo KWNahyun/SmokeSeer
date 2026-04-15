@@ -80,6 +80,8 @@ class GaussianSmokeThermalModel:
             self._rotation,
             self._opacity,
             self._opacity_thermal,
+            self._opacity_duration_center,
+            self._opacity_duration_var,
             self.max_radii2D,
             self.xyz_gradient_accum,
             self.denom,
@@ -98,6 +100,8 @@ class GaussianSmokeThermalModel:
         self._rotation, 
         self._opacity,
         self._opacity_thermal,
+        self._opacity_duration_center,
+        self._opacity_duration_var,
         self.max_radii2D, 
         xyz_gradient_accum, 
         denom,
@@ -137,7 +141,7 @@ class GaussianSmokeThermalModel:
         return self.opacity_activation(self._opacity)
     
     def get_opacity_at_t(self, t, training=False):
-        return (time_bigaussian(self._opacity_duration_center, self._opacity_duration_var, t, training=training, var_min=0.1) \
+        return (time_bigaussian(self._opacity_duration_center, self._opacity_duration_var, torch.tensor(t).cuda() if not isinstance(t, torch.Tensor) else t.cuda(), training=training, var_min=0.1) \
                             * self.get_opacity)
         
     @property

@@ -119,12 +119,12 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_fold
 
         if "gt" in image_name:
             continue
-        image = Image.open(image_path)
+        image = image_path  # lazy load
         #Append _gt to the image name
         gt_name = image_name + "_gt." + image_path.split(".")[1]
         gt_path = os.path.join(images_folder, gt_name)
         if os.path.exists(gt_path):
-            gt_desmoked_image = Image.open(gt_path)
+            gt_desmoked_image = gt_path  # lazy load
         else:
             gt_desmoked_image = None
 
@@ -132,7 +132,7 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_fold
         alpha_mask_path = os.path.join(images_folder + "_mask", image_name + ".png")
 
         if os.path.exists(alpha_mask_path):
-            alpha_mask = Image.open(alpha_mask_path)
+            alpha_mask = alpha_mask_path  # lazy load
 
         cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
                               image_path=image_path, image_name=image_name, width=width, height=height, 
@@ -315,7 +315,7 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
 
             image_path = os.path.join(path, cam_name)
             image_name = Path(cam_name).stem
-            image = Image.open(image_path)
+            image = image_path  # lazy load
 
             im_data = np.array(image.convert("RGBA"))
 
