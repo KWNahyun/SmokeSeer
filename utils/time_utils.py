@@ -39,13 +39,13 @@ class Embedder:
         N_freqs = self.kwargs['num_freqs']
 
         if self.kwargs['log_sampling']:
-            freq_bands = 2. ** torch.linspace(0., max_freq, steps=N_freqs)
+            freq_bands = 2. ** torch.linspace(0., max_freq, steps=N_freqs).cuda()
         else:
-            freq_bands = torch.linspace(2. ** 0., 2. ** max_freq, steps=N_freqs)
+            freq_bands = torch.linspace(2. ** 0., 2. ** max_freq, steps=N_freqs).cuda()
 
         for freq in freq_bands:
             for p_fn in self.kwargs['periodic_fns']:
-                embed_fns.append(lambda x, p_fn=p_fn, freq=freq: p_fn(x * freq))
+                embed_fns.append(lambda x, p_fn=p_fn, freq=freq: p_fn(x * freq.to(x.device)))
                 out_dim += d
 
         self.embed_fns = embed_fns
@@ -103,10 +103,10 @@ class DeformNetwork(nn.Module):
         self.gaussian_opacity = nn.Linear(W, 1)
 
     def forward(self, x, t):
-        t_emb = self.embed_time_fn(t)
+        t_emb = self.embed_time_fn(t.cuda() if hasattr(t, "cuda") else t)
         if self.is_blender:
             t_emb = self.timenet(t_emb)  # better for D-NeRF Dataset
-        x_emb = self.embed_fn(x)
+        x_emb = self.embed_fn(x.cuda() if hasattr(x, "cuda") else x)
         h = torch.cat([x_emb, t_emb], dim=-1)
         for i, l in enumerate(self.linear):
             h = self.linear[i](h)

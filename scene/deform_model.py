@@ -14,7 +14,8 @@ class DeformModel:
         self.spatial_lr_scale = 5
 
     def step(self, xyz, time_emb):
-        return self.deform(xyz, time_emb)
+        result = self.deform(xyz, time_emb)
+        return tuple(r.cuda() if isinstance(r, torch.Tensor) else r for r in result)
 
     def train_setting(self, training_args):
         l = [
@@ -40,7 +41,7 @@ class DeformModel:
         else:
             loaded_iter = iteration
         weights_path = os.path.join(model_path, "deform/iteration_{}/deform.pth".format(loaded_iter))
-        self.deform.load_state_dict(torch.load(weights_path))
+        self.deform.load_state_dict(torch.load(weights_path, map_location="cuda"))
 
     def update_learning_rate(self, iteration):
         for param_group in self.optimizer.param_groups:
