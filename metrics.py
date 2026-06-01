@@ -129,7 +129,10 @@ def measure_render_speed(model_path: Path, n_warmup: int = 10, n_measure: int = 
     gaussians_smoke.restore(params_k, dataset)
 
     deform = DeformModel(True, False)
-    deform.load_weights(str(model_path / '_ft_thermal'))
+    ft_path = str(model_path.parent / (model_path.name + "_ft_thermal"))
+    if not os.path.exists(os.path.join(ft_path, "deform")):
+        ft_path = str(model_path / "_ft_thermal")
+    deform.load_weights(ft_path)
 
     bg_color = torch.tensor([0, 0, 0], dtype=torch.float32, device="cuda")
     parser_  = ArgumentParser()

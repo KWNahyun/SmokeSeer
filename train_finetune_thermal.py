@@ -2,7 +2,8 @@ import os
 import torch
 from random import randint
 from utils.loss_utils import l1_loss, ssim
-from gaussian_renderer.gsplat_render import render, render_surface_smoke
+from gaussian_renderer.gsplat_render import render, render_surface_smoke, render_imp, render_depth
+import numpy as np
 USE_GSPLAT = True
 import sys
 from scene import Scene, DeformModel, GaussianSmokeThermalModel, GaussianSurfaceThermalModel
@@ -24,6 +25,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     opt.iterations = opt.iterations_stage2
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+    simp_iteration1 = opt.densify_until_iter
+    mask_blur_surface = torch.zeros(gaussians_surface.get_xyz.shape[0], device="cuda")
+    mask_blur_smoke = torch.zeros(gaussians_smoke.get_xyz.shape[0], device="cuda")
 
     scene_surface = Scene(dataset, gaussians_smoke)
     deform = DeformModel(True, False)
@@ -220,16 +224,54 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     gaussians_smoke.add_densification_stats(viewspace_points.grad[gaussians_surface.get_xyz.shape[0]:], visibility_filter_smoke)
 
                 gaussians_smoke.max_radii2D[visibility_filter_smoke] = torch.max(gaussians_smoke.max_radii2D[visibility_filter_smoke], radii_smoke[visibility_filter_smoke])                
-                if iteration > opt.densify_from_iter_stage2 and iteration % opt.densification_interval == 0:
+                if iteration > opt.densify_from_iter_stage2 and iteration % opt.densification_interval == 0 and iteration % 5000 != 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    gaussians_surface.densify_and_prune(opt.densify_grad_threshold_surface, opt.prune_opacity_surface_threshold, scene_surface.cameras_extent, size_threshold)
-                    gaussians_smoke.densify_and_prune(opt.densify_grad_threshold_smoke, 0.005, scene_surface.cameras_extent, size_threshold)
+                    gaussians_surface.densify_and_prune_split(opt.densify_grad_threshold_surface, opt.prune_opacity_surface_threshold, scene_surface.cameras_extent, size_threshold, mask_blur_surface)
+                    gaussians_smoke.densify_and_prune_split(opt.densify_grad_threshold_smoke, 0.005, scene_surface.cameras_extent, size_threshold, mask_blur_smoke)
+                    mask_blur_surface = torch.zeros(gaussians_surface.get_xyz.shape[0], device="cuda")
+                    mask_blur_smoke = torch.zeros(gaussians_smoke.get_xyz.shape[0], device="cuda")
+
+                if iteration % 5000 == 0 and iteration > opt.densify_from_iter_stage2 and iteration < opt.densify_until_iter:
+                    out_pts_list, gt_list = [], []
+                    views = scene_surface.getTrainCameras()
+                    for view in views:
+                        gt = view.original_image[0:3, :, :]
+                        res = render_depth(view, gaussians_surface, pipe)
+                        out_pts = res["out_pts"]
+                        accum_alpha = res["accum_alpha"]
+                        prob = (1 - accum_alpha).reshape(-1)
+                        prob = (prob / prob.sum()).cpu().numpy()
+                        num_sampled = max(1, int(len(prob) / (view.image_height * view.image_width * len(views) / opt.num_depth)))
+                        indices = np.random.choice(len(prob), size=num_sampled, p=prob, replace=False)
+                        out_pts_list.append(out_pts.permute(1,2,0).reshape(-1,3)[indices])
+                        gt_list.append(gt.permute(1,2,0).reshape(-1,3)[indices])
+                    gaussians_surface.reinitial_pts(torch.cat(out_pts_list), torch.cat(gt_list))
+                    gaussians_surface.training_setup(opt)
+                    mask_blur_surface = torch.zeros(gaussians_surface.get_xyz.shape[0], device="cuda")
+                    torch.cuda.empty_cache()
 
                 if iteration < 20000 and (iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter)):
                     gaussians_surface.reset_opacity()
                     gaussians_smoke.reset_opacity()
 
             # Optimizer step
+
+            if iteration == simp_iteration1:
+                for gaussians, label in [(gaussians_surface, "surface"), (gaussians_smoke, "smoke")]:
+                    imp_score = torch.zeros(gaussians.get_xyz.shape[0]).cuda()
+                    views = scene_surface.getTrainCameras()
+                    for view in views:
+                        pkg = render_imp(view, gaussians, pipe)
+                        area_max = pkg["area_max"]
+                        mask_t = area_max != 0
+                        temp = imp_score + pkg["accum_weights"] / (pkg["area_proj"] + 1e-6)
+                        imp_score[mask_t] = temp[mask_t]
+                    non_prune_mask = imp_score > imp_score.mean() * 0.1
+                    gaussians.prune_points(~non_prune_mask)
+                    print(f"\n[Mini-Splatting] {label} simplified to {gaussians.get_xyz.shape[0]:,} at iter {iteration}")
+                mask_blur_surface = torch.zeros(gaussians_surface.get_xyz.shape[0], device="cuda")
+                mask_blur_smoke = torch.zeros(gaussians_smoke.get_xyz.shape[0], device="cuda")
+                torch.cuda.empty_cache()
             if iteration < opt.iterations:
                 # For surface gaussians, only update parameters in non-smoke regions
                 if viewpoint_cam.smoke_mask is not None:

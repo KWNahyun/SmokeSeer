@@ -105,6 +105,8 @@ class OptimizationParams(ParamGroup):
         self.densify_grad_threshold_smoke = 0.0001
         self.densify_grad_threshold_surface = 0.0001
         self.prune_opacity_surface_threshold = 0.005
+        self.num_max = 1500000  # Mini-Splatting: max gaussians during densification
+        self.num_depth = 300000  # Mini-Splatting: depth reinitialization sample count
         self.prune_more_opacity_ratio = 0.05
         self.random_background = False
         self.smoke_opacity_weight = 0.1

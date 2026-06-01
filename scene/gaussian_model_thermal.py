@@ -591,6 +591,82 @@ class GaussianSmokeThermalModel:
             prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
         self.prune_points(prune_mask)
 
+
+    def densify_and_prune_split(self, max_grad, min_opacity, extent, max_screen_size, mask):
+        grads = self.xyz_gradient_accum / self.denom
+        grads[grads.isnan()] = 0.0
+        self.densify_and_clone(grads, max_grad, extent)
+        self.densify_and_split_mask(grads, max_grad, extent, mask)
+        prune_mask = (self.get_opacity < min_opacity).squeeze()
+        if max_screen_size:
+            big_points_vs = self.max_radii2D > max_screen_size
+            big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
+            prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
+        self.prune_points(prune_mask)
+        torch.cuda.empty_cache()
+
+    def densify_and_split_mask(self, grads, grad_threshold, scene_extent, mask, N=2):
+        n_init_points = self.get_xyz.shape[0]
+        padded_grad = torch.zeros((n_init_points), device="cuda")
+        padded_grad[:grads.shape[0]] = grads.squeeze()
+        selected_pts_mask = torch.where(padded_grad >= grad_threshold, True, False)
+        selected_pts_mask = torch.logical_and(selected_pts_mask,
+                                              torch.max(self.get_scaling, dim=1).values > self.percent_dense*scene_extent)
+        padded_mask = torch.zeros((n_init_points), dtype=torch.bool, device="cuda")
+        if mask.shape[0] > 0:
+            padded_mask[:mask.shape[0]] = mask
+        selected_pts_mask = torch.logical_or(selected_pts_mask, padded_mask)
+        stds = self.get_scaling[selected_pts_mask].repeat(N,1)
+        means = torch.zeros((stds.size(0), 3), device="cuda")
+        samples = torch.normal(mean=means, std=stds)
+        rots = build_rotation(self._rotation[selected_pts_mask]).repeat(N,1,1)
+        new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[selected_pts_mask].repeat(N, 1)
+        new_scaling = self.scaling_inverse_activation(self.get_scaling[selected_pts_mask].repeat(N,1) / (0.8*N))
+        new_rotation = self._rotation[selected_pts_mask].repeat(N,1)
+        new_features_dc = self._features_dc[selected_pts_mask].repeat(N,1,1)
+        new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
+        new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
+        new_opacity_thermal = self._opacity_thermal[selected_pts_mask].repeat(N,1)
+        new_opacity_duration_center = self._opacity_duration_center[selected_pts_mask].repeat(N,1,1)
+        new_opacity_duration_var = self._opacity_duration_var[selected_pts_mask].repeat(N,1,1)
+        new_features_dc_thermal = self._features_thermal_dc[selected_pts_mask].repeat(N,1,1)
+        new_features_rest_thermal = self._features_thermal_rest[selected_pts_mask].repeat(N,1,1)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_features_dc_thermal, new_features_rest_thermal, new_opacity, new_opacity_thermal, new_opacity_duration_center, new_opacity_duration_var, new_scaling, new_rotation)
+        prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
+        self.prune_points(prune_filter)
+
+    def reinitial_pts(self, pts, rgb):
+        from utils.sh_utils import RGB2SH
+        from simple_knn._C import distCUDA2
+        fused_point_cloud = pts
+        fused_color = RGB2SH(rgb)
+        features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
+        features[:, :3, 0] = fused_color
+        features[:, 3:, 1:] = 0.0
+        dist2 = torch.clamp_min(distCUDA2(fused_point_cloud), 0.0000001)
+        scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)
+        rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
+        rots[:, 0] = 1
+        opacities = inverse_sigmoid(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
+        opacities_thermal = inverse_sigmoid(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
+        self._opacity_duration_center = nn.Parameter(torch.ones((fused_point_cloud.shape[0], 2, 1), dtype=torch.float, device="cuda"))
+        self._opacity_duration_var = nn.Parameter(torch.ones((fused_point_cloud.shape[0], 2, 1), dtype=torch.float, device="cuda"))
+        self._opacity_duration_center.data[:,0,0] = 0.25
+        self._opacity_duration_center.data[:,1,0] = 0.75
+        self._opacity_duration_var.data[:,0,0] = 0.25
+        self._opacity_duration_var.data[:,1,0] = 0.25
+        self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
+        self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
+        self._features_rest = nn.Parameter(features[:,:,1:].transpose(1, 2).contiguous().requires_grad_(True))
+        self._features_thermal_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
+        self._features_thermal_rest = nn.Parameter(features[:,:,1:].transpose(1, 2).contiguous().requires_grad_(True))
+        self._features_thermal_dc.data.fill_(0.9)
+        self._features_thermal_rest.data.fill_(0.0)
+        self._scaling = nn.Parameter(scales.requires_grad_(True))
+        self._rotation = nn.Parameter(rots.requires_grad_(True))
+        self._opacity = nn.Parameter(opacities.requires_grad_(True))
+        self._opacity_thermal = nn.Parameter(opacities_thermal.requires_grad_(True))
+        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
         torch.cuda.empty_cache()
 
     @torch.no_grad()
@@ -1156,6 +1232,71 @@ class GaussianSurfaceThermalModel:
             prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
         self.prune_points(prune_mask)
 
+
+    def densify_and_prune_split(self, max_grad, min_opacity, extent, max_screen_size, mask):
+        grads = self.xyz_gradient_accum / self.denom
+        grads[grads.isnan()] = 0.0
+        self.densify_and_clone(grads, max_grad, extent)
+        self.densify_and_split_mask(grads, max_grad, extent, mask)
+        prune_mask = (self.get_opacity < min_opacity).squeeze()
+        if max_screen_size:
+            big_points_vs = self.max_radii2D > max_screen_size
+            big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
+            prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
+        self.prune_points(prune_mask)
+        torch.cuda.empty_cache()
+
+    def densify_and_split_mask(self, grads, grad_threshold, scene_extent, mask, N=2):
+        n_init_points = self.get_xyz.shape[0]
+        padded_grad = torch.zeros((n_init_points), device="cuda")
+        padded_grad[:grads.shape[0]] = grads.squeeze()
+        selected_pts_mask = torch.where(padded_grad >= grad_threshold, True, False)
+        selected_pts_mask = torch.logical_and(selected_pts_mask,
+                                              torch.max(self.get_scaling, dim=1).values > self.percent_dense*scene_extent)
+        padded_mask = torch.zeros((n_init_points), dtype=torch.bool, device="cuda")
+        if mask.shape[0] > 0:
+            padded_mask[:mask.shape[0]] = mask
+        selected_pts_mask = torch.logical_or(selected_pts_mask, padded_mask)
+        stds = self.get_scaling[selected_pts_mask].repeat(N,1)
+        means = torch.zeros((stds.size(0), 3), device="cuda")
+        samples = torch.normal(mean=means, std=stds)
+        rots = build_rotation(self._rotation[selected_pts_mask]).repeat(N,1,1)
+        new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[selected_pts_mask].repeat(N, 1)
+        new_scaling = self.scaling_inverse_activation(self.get_scaling[selected_pts_mask].repeat(N,1) / (0.8*N))
+        new_rotation = self._rotation[selected_pts_mask].repeat(N,1)
+        new_features_dc = self._features_dc[selected_pts_mask].repeat(N,1,1)
+        new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
+        new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
+        new_features_dc_thermal = self._features_thermal_dc[selected_pts_mask].repeat(N,1,1)
+        new_features_rest_thermal = self._features_thermal_rest[selected_pts_mask].repeat(N,1,1)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_features_dc_thermal, new_features_rest_thermal, new_opacity, new_scaling, new_rotation)
+        prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
+        self.prune_points(prune_filter)
+
+    def reinitial_pts(self, pts, rgb):
+        from utils.sh_utils import RGB2SH
+        from simple_knn._C import distCUDA2
+        fused_point_cloud = pts
+        fused_color = RGB2SH(rgb)
+        features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
+        features[:, :3, 0] = fused_color
+        features[:, 3:, 1:] = 0.0
+        dist2 = torch.clamp_min(distCUDA2(fused_point_cloud), 0.0000001)
+        scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)
+        rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
+        rots[:, 0] = 1
+        opacities = inverse_sigmoid(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
+        self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
+        self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
+        self._features_rest = nn.Parameter(features[:,:,1:].transpose(1, 2).contiguous().requires_grad_(True))
+        self._features_thermal_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
+        self._features_thermal_rest = nn.Parameter(features[:,:,1:].transpose(1, 2).contiguous().requires_grad_(True))
+        self._features_thermal_dc.data.fill_(0.9)
+        self._features_thermal_rest.data.fill_(0.0)
+        self._scaling = nn.Parameter(scales.requires_grad_(True))
+        self._rotation = nn.Parameter(rots.requires_grad_(True))
+        self._opacity = nn.Parameter(opacities.requires_grad_(True))
+        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
         torch.cuda.empty_cache()
 
     @torch.no_grad()

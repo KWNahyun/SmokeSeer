@@ -13,6 +13,8 @@ from arguments import ModelParams, PipelineParams, OptimizationParams
 import wandb
 from datetime import datetime
 from utils.pose_optimization import CameraOptModule
+import numpy as np
+from gaussian_renderer.gsplat_render import render_imp, render_depth
 import torch.cuda
 
 
@@ -31,6 +33,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
+    simp_iteration1 = opt.densify_until_iter
+    mask_blur = torch.zeros(gaussians_surface._xyz.shape[0], device="cuda")
     iter_start = torch.cuda.Event(enable_timing=True)
     iter_end = torch.cuda.Event(enable_timing=True)
 
@@ -131,13 +135,52 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if dataset.use_thermal:
                     gaussians_surface.add_densification_stats(viewspace_points_thermal.grad, visibility_filter_surface_thermal, width=viewpoint_cam_thermal.image_width, height=viewpoint_cam_thermal.image_height)
                     
-                if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
+                if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0 and iteration % 5000 != 0 and gaussians_surface._xyz.shape[0] < opt.num_max:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    gaussians_surface.densify_and_prune(opt.densify_grad_threshold_surface, 0.01, scene_surface.cameras_extent, size_threshold)
+                    gaussians_surface.densify_and_prune_split(opt.densify_grad_threshold_surface, 0.01, scene_surface.cameras_extent, size_threshold, mask_blur)
+                    mask_blur = torch.zeros(gaussians_surface._xyz.shape[0], device="cuda")
+
+                if iteration % 5000 == 0 and iteration > opt.densify_from_iter and iteration < opt.densify_until_iter:
+                    out_pts_list, gt_list = [], []
+                    views = scene_surface.getTrainCamerasThermal()
+                    for view in views:
+                        gt = view.original_image[0:3, :, :]
+                        res = render_depth(view, gaussians_surface, pipe)
+                        out_pts = res["out_pts"]
+                        accum_alpha = res["accum_alpha"]
+                        prob = (1 - accum_alpha).reshape(-1)
+                        prob = (prob / prob.sum()).cpu().numpy()
+                        num_sampled = int(len(prob) / (view.image_height * view.image_width * len(views) / opt.num_depth))
+                        num_sampled = max(1, num_sampled)
+                        indices = np.random.choice(len(prob), size=num_sampled, p=prob, replace=False)
+                        out_pts_list.append(out_pts.permute(1,2,0).reshape(-1,3)[indices])
+                        gt_list.append(gt.permute(1,2,0).reshape(-1,3)[indices])
+                    gaussians_surface.reinitial_pts(torch.cat(out_pts_list), torch.cat(gt_list))
+                    gaussians_surface.training_setup(opt)
+                    mask_blur = torch.zeros(gaussians_surface._xyz.shape[0], device="cuda")
+                    torch.cuda.empty_cache()
 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians_surface.reset_opacity()
 
+
+            if iteration == simp_iteration1:
+                imp_score = torch.zeros(gaussians_surface._xyz.shape[0]).cuda()
+                views = scene_surface.getTrainCamerasThermal()
+                for view in views:
+                    render_pkg_imp = render_imp(view, gaussians_surface, pipe)
+                    accum_weights = render_pkg_imp["accum_weights"]
+                    area_proj = render_pkg_imp["area_proj"]
+                    area_max = render_pkg_imp["area_max"]
+                    mask_t = area_max != 0
+                    temp = imp_score + accum_weights / (area_proj + 1e-6)
+                    imp_score[mask_t] = temp[mask_t]
+                non_prune_mask = imp_score > imp_score.mean() * 0.1
+                prune_mask = ~non_prune_mask
+                gaussians_surface.prune_points(prune_mask)
+                mask_blur = torch.zeros(gaussians_surface._xyz.shape[0], device="cuda")
+                print(f"\n[Mini-Splatting] Simplified to {gaussians_surface._xyz.shape[0]:,} gaussians at iter {iteration}")
+                torch.cuda.empty_cache()
             if iteration < opt.iterations_stage1:
                 gaussians_surface.optimizer.step()
                 if dataset.pose_opt:

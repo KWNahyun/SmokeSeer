@@ -228,3 +228,82 @@ def render_surface_smoke(
         "inv_depth":                 inv_depth,
         "render_alphas":             render_alphas,
     }
+
+
+# ---------------------------------------------------------------------------
+# Mini-Splatting: importance score & depth rendering
+# (uses diff_gaussian_rasterization_ms CUDA backend)
+# ---------------------------------------------------------------------------
+
+def _ms_raster_settings(viewpoint_camera, pc, pipe):
+    """Build GaussianRasterizationSettings for _ms rasterizer."""
+    import math as _math
+    from diff_gaussian_rasterization_ms import GaussianRasterizationSettings
+    tanfovx = _math.tan(viewpoint_camera.FoVx * 0.5)
+    tanfovy = _math.tan(viewpoint_camera.FoVy * 0.5)
+    return GaussianRasterizationSettings(
+        image_height=int(viewpoint_camera.image_height),
+        image_width=int(viewpoint_camera.image_width),
+        tanfovx=tanfovx,
+        tanfovy=tanfovy,
+        bg=torch.zeros(3, device="cuda"),
+        scale_modifier=1.0,
+        viewmatrix=viewpoint_camera.world_view_transform,
+        projmatrix=viewpoint_camera.full_proj_transform,
+        sh_degree=pc.active_sh_degree,
+        campos=viewpoint_camera.camera_center,
+        prefiltered=False,
+        debug=pipe.debug,
+    )
+
+
+@torch.no_grad()
+def render_imp(viewpoint_camera, pc, pipe):
+    """Render with importance scores (accum_weights, area_proj, area_max)."""
+    from diff_gaussian_rasterization_ms import GaussianRasterizer
+    raster_settings = _ms_raster_settings(viewpoint_camera, pc, pipe)
+    rasterizer = GaussianRasterizer(raster_settings=raster_settings)
+
+    screenspace_points = torch.zeros_like(
+        pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=False, device="cuda")
+
+    rendered_image, radii, accum_weights, area_proj, area_max = rasterizer(
+        means3D=pc.get_xyz,
+        means2D=screenspace_points,
+        shs=pc.get_features,
+        colors_precomp=None,
+        opacities=pc.get_opacity,
+        scales=pc.get_scaling,
+        rotations=pc.get_rotation,
+        cov3D_precomp=None,
+    )
+    return {
+        "render":         rendered_image,
+        "radii":          radii,
+        "accum_weights":  accum_weights,
+        "area_proj":      area_proj,
+        "area_max":       area_max,
+    }
+
+
+@torch.no_grad()
+def render_depth(viewpoint_camera, pc, pipe):
+    """Render depth map for depth reinitialization."""
+    from diff_gaussian_rasterization_ms import GaussianRasterizer
+    raster_settings = _ms_raster_settings(viewpoint_camera, pc, pipe)
+    rasterizer = GaussianRasterizer(raster_settings=raster_settings)
+
+    screenspace_points = torch.zeros_like(
+        pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=False, device="cuda")
+
+    res = rasterizer.render_depth(
+        means3D=pc.get_xyz,
+        means2D=screenspace_points,
+        shs=pc.get_features,
+        colors_precomp=None,
+        opacities=pc.get_opacity,
+        scales=pc.get_scaling,
+        rotations=pc.get_rotation,
+        cov3D_precomp=None,
+    )
+    return res
