@@ -16,7 +16,7 @@ import wandb
 from datetime import datetime
 from render import render_test, render_test_thermal
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, checkpoint_smoke=None):
     first_iter = 0
 
     gaussians_smoke = GaussianSmokeThermalModel(dataset.sh_degree_stage2)       
@@ -34,6 +34,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     deform.train_setting(opt)
 
     (model_params, first_iter) = torch.load(checkpoint)
+    if checkpoint_smoke is not None:
+        (model_params_smoke, _) = torch.load(checkpoint_smoke)
+        gaussians_smoke.restore(model_params_smoke, opt)
+        print(f"Loaded smoke checkpoint: {checkpoint_smoke}")
     gaussians_surface.restore(model_params, opt)
         
     gaussians_smoke.training_setup(opt)
@@ -181,6 +185,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             Ll1depth_rgb = 0
             Ll1_thermal = 0
 
+        mask_loss_surface = opt.lambda_mask * torch.mean(torch.sigmoid(gaussians_surface._mask))
+        mask_loss_smoke = opt.lambda_mask * torch.mean(torch.sigmoid(gaussians_smoke._mask))
+        total_loss = total_loss + mask_loss_surface + mask_loss_smoke
         total_loss.backward()
         iter_end.record()
 
@@ -253,6 +260,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if iteration < 20000 and (iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter)):
                     gaussians_surface.reset_opacity()
                     gaussians_smoke.reset_opacity()
+                if iteration % opt.mask_prune_iter == 0 and iteration > opt.densify_until_iter:
+                    gaussians_surface.mask_prune()
+                    gaussians_smoke.mask_prune()
 
             # Optimizer step
 
@@ -328,6 +338,7 @@ if __name__ == "__main__":
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
     parser.add_argument("--test_iterations", nargs="+", type=int, default=[1000, 2000, 5000, 7_000, 12_000, 15_000, 22_000, 30_000])
+    parser.add_argument("--start_checkpoint_smoke", type=str, default=None)
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 15_000, 22_000, 30_000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[7_000, 15_000, 22_000, 30_000])
@@ -360,5 +371,5 @@ if __name__ == "__main__":
     safe_state(args.quiet)
 
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, checkpoint_smoke=args.start_checkpoint_smoke)
     print("\nTraining complete.")

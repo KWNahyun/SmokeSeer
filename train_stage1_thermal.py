@@ -110,6 +110,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         else:
             Ll1depth = 0
 
+        mask_loss = opt.lambda_mask * torch.mean(torch.sigmoid(gaussians_surface._mask))
+        total_loss += mask_loss
         total_loss.backward()
         iter_end.record()
         
@@ -162,6 +164,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians_surface.reset_opacity()
+                if iteration % opt.mask_prune_iter == 0 and iteration > opt.densify_until_iter:
+                    gaussians_surface.mask_prune()
 
 
             if iteration == simp_iteration1:

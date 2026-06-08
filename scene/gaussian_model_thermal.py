@@ -60,6 +60,7 @@ class GaussianSmokeThermalModel:
         self._opacity_duration_var = torch.empty(0)
         
         self._opacity_thermal = torch.empty(0)
+        self._mask = torch.empty(0)
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
         self.denom = torch.empty(0)
@@ -82,6 +83,7 @@ class GaussianSmokeThermalModel:
             self._opacity_thermal,
             self._opacity_duration_center,
             self._opacity_duration_var,
+            self._mask,
             self.max_radii2D,
             self.xyz_gradient_accum,
             self.denom,
@@ -90,26 +92,24 @@ class GaussianSmokeThermalModel:
         )
     
     def restore(self, model_args, training_args):
-        (self.active_sh_degree, 
-        self._xyz, 
-        self._features_dc, 
-        self._features_rest,
-        self._features_thermal_dc,
-        self._features_thermal_rest,
-        self._scaling, 
-        self._rotation, 
-        self._opacity,
-        self._opacity_thermal,
-        self._opacity_duration_center,
-        self._opacity_duration_var,
-        self.max_radii2D, 
-        xyz_gradient_accum, 
-        denom,
-        opt_dict, 
-        self.spatial_lr_scale) = model_args
+        if len(model_args) == 18:
+            (self.active_sh_degree, self._xyz, self._features_dc, self._features_rest,
+             self._features_thermal_dc, self._features_thermal_rest, self._scaling,
+             self._rotation, self._opacity, self._opacity_thermal,
+             self._opacity_duration_center, self._opacity_duration_var,
+             self._mask, self.max_radii2D, xyz_gradient_accum,
+             denom, opt_dict, self.spatial_lr_scale) = model_args
+        else:
+            (self.active_sh_degree, self._xyz, self._features_dc, self._features_rest,
+             self._features_thermal_dc, self._features_thermal_rest, self._scaling,
+             self._rotation, self._opacity, self._opacity_thermal,
+             self._opacity_duration_center, self._opacity_duration_var,
+             self.max_radii2D, xyz_gradient_accum, denom, opt_dict,
+             self.spatial_lr_scale) = model_args
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
+        opt_dict['param_groups'] = [g for g in opt_dict['param_groups'] if g.get('name') != 'mask']
         self.optimizer.load_state_dict(opt_dict)
 
     @property
@@ -198,6 +198,7 @@ class GaussianSmokeThermalModel:
         self._scaling = nn.Parameter(scales.requires_grad_(True))
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
+        self._mask = nn.Parameter(torch.ones((self.get_xyz.shape[0], 1), device="cuda").requires_grad_(True))
         self._opacity_thermal = nn.Parameter(opacities_thermal.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
@@ -217,6 +218,7 @@ class GaussianSmokeThermalModel:
         self._features_thermal_rest.requires_grad_(True)
         self._opacity_duration_center.requires_grad_(True)
         self._opacity_duration_var.requires_grad_(True)
+        self._mask.requires_grad_(True)
 
         l = [
             {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
@@ -229,7 +231,7 @@ class GaussianSmokeThermalModel:
             {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
             {'params': [self._opacity_duration_center], 'lr': 0.001, "name": "motion_opacity_center"},
             {'params': [self._opacity_duration_var], 'lr': 0.0005, "name": "motion_opacity_var"},
-            {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"}
+            {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
         ]
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
@@ -403,8 +405,8 @@ class GaussianSmokeThermalModel:
         for group in self.optimizer.param_groups:
             stored_state = self.optimizer.state.get(group['params'][0], None)
             if stored_state is not None:
-                stored_state["exp_avg"] = stored_state["exp_avg"][mask]
-                stored_state["exp_avg_sq"] = stored_state["exp_avg_sq"][mask]
+                stored_state["exp_avg"] = stored_state["exp_avg"][mask] if stored_state["exp_avg"].shape[0] == mask.shape[0] else stored_state["exp_avg"][mask.unsqueeze(-1).expand_as(stored_state["exp_avg"])]
+                stored_state["exp_avg_sq"] = stored_state["exp_avg_sq"][mask] if stored_state["exp_avg_sq"].shape[0] == mask.shape[0] else stored_state["exp_avg_sq"][mask.unsqueeze(-1).expand_as(stored_state["exp_avg_sq"])]
 
                 del self.optimizer.state[group['params'][0]]
                 group["params"][0] = nn.Parameter((group["params"][0][mask].requires_grad_(True)))
@@ -431,10 +433,9 @@ class GaussianSmokeThermalModel:
         self._opacity_thermal = optimizable_tensors["opacity_thermal"]
         self._opacity_duration_center = optimizable_tensors["motion_opacity_center"]
         self._opacity_duration_var = optimizable_tensors["motion_opacity_var"]
-
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
-
+        self._mask = nn.Parameter(self._mask[valid_points_mask].detach().requires_grad_(True))
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
@@ -443,19 +444,21 @@ class GaussianSmokeThermalModel:
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
             assert len(group["params"]) == 1
+            if group["name"] not in tensors_dict:
+                continue
             extension_tensor = tensors_dict[group["name"]]
             stored_state = self.optimizer.state.get(group['params'][0], None)
             if stored_state is not None:
-                stored_state["exp_avg"] = torch.cat((stored_state["exp_avg"], torch.zeros_like(extension_tensor)), dim=0)
-                stored_state["exp_avg_sq"] = torch.cat((stored_state["exp_avg_sq"], torch.zeros_like(extension_tensor)), dim=0)
+                stored_state["exp_avg"] = torch.cat((stored_state["exp_avg"].cuda(), torch.zeros_like(extension_tensor).cuda()), dim=0)
+                stored_state["exp_avg_sq"] = torch.cat((stored_state["exp_avg_sq"].cuda(), torch.zeros_like(extension_tensor).cuda()), dim=0)
 
                 del self.optimizer.state[group['params'][0]]
-                group["params"][0] = nn.Parameter(torch.cat((group["params"][0], extension_tensor), dim=0).requires_grad_(True))
+                group["params"][0] = nn.Parameter(torch.cat((group["params"][0].cuda(), extension_tensor.cuda()), dim=0).requires_grad_(True))
                 self.optimizer.state[group['params'][0]] = stored_state
 
                 optimizable_tensors[group["name"]] = group["params"][0]
             else:
-                group["params"][0] = nn.Parameter(torch.cat((group["params"][0], extension_tensor), dim=0).requires_grad_(True))
+                group["params"][0] = nn.Parameter(torch.cat((group["params"][0].cuda(), extension_tensor.cuda()), dim=0).requires_grad_(True))
                 optimizable_tensors[group["name"]] = group["params"][0]
 
         return optimizable_tensors
@@ -471,7 +474,7 @@ class GaussianSmokeThermalModel:
         "f_thermal_dc": new_features_thermal_dc,
         "f_thermal_rest": new_features_thermal_rest,
         "motion_opacity_center": new_opacity_duration_center,
-        "motion_opacity_var": new_opacity_duration_var
+        "motion_opacity_var": new_opacity_duration_var,
         }
 
         optimizable_tensors = self.cat_tensors_to_optimizer(d)
@@ -486,7 +489,7 @@ class GaussianSmokeThermalModel:
         self._features_thermal_rest = optimizable_tensors["f_thermal_rest"]
         self._opacity_duration_center = optimizable_tensors["motion_opacity_center"]
         self._opacity_duration_var = optimizable_tensors["motion_opacity_var"]
-
+        self._mask = nn.Parameter(torch.cat([self._mask.cuda(), torch.ones((new_xyz.shape[0], 1), device="cuda")], dim=0).detach().requires_grad_(True))
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
@@ -589,7 +592,12 @@ class GaussianSmokeThermalModel:
             big_points_vs = self.max_radii2D > max_screen_size
             big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
             prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
+        torch.cuda.empty_cache()
+
+    def mask_prune(self):
+        prune_mask = (torch.sigmoid(self._mask) <= 0.01).squeeze(-1)
         self.prune_points(prune_mask)
+        torch.cuda.empty_cache()
 
 
     def densify_and_prune_split(self, max_grad, min_opacity, extent, max_screen_size, mask):
@@ -667,6 +675,7 @@ class GaussianSmokeThermalModel:
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self._opacity_thermal = nn.Parameter(opacities_thermal.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        self._mask = nn.Parameter(torch.ones((fused_point_cloud.shape[0], 1), device="cuda").requires_grad_(True))
         torch.cuda.empty_cache()
 
     @torch.no_grad()
@@ -756,6 +765,7 @@ class GaussianSurfaceThermalModel:
         self._scaling = torch.empty(0)
         self._rotation = torch.empty(0)
         self._opacity = torch.empty(0)
+        self._mask = torch.empty(0)
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
         self.denom = torch.empty(0)
@@ -775,6 +785,7 @@ class GaussianSurfaceThermalModel:
             self._scaling,
             self._rotation,
             self._opacity,
+            self._mask,
             self.max_radii2D,
             self.xyz_gradient_accum,
             self.denom,
@@ -783,23 +794,20 @@ class GaussianSurfaceThermalModel:
         )
     
     def restore(self, model_args, training_args):
-        (self.active_sh_degree, 
-        self._xyz, 
-        self._features_dc, 
-        self._features_rest,
-        self._features_thermal_dc,
-        self._features_thermal_rest,
-        self._scaling, 
-        self._rotation, 
-        self._opacity,
-        self.max_radii2D, 
-        xyz_gradient_accum, 
-        denom,
-        opt_dict, 
-        self.spatial_lr_scale) = model_args
+        if len(model_args) == 15:
+            (self.active_sh_degree, self._xyz, self._features_dc, self._features_rest,
+            self._features_thermal_dc, self._features_thermal_rest, self._scaling,
+            self._rotation, self._opacity, self._mask, self.max_radii2D,
+            xyz_gradient_accum, denom, opt_dict, self.spatial_lr_scale) = model_args
+        else:
+            (self.active_sh_degree, self._xyz, self._features_dc, self._features_rest,
+            self._features_thermal_dc, self._features_thermal_rest, self._scaling,
+            self._rotation, self._opacity, self.max_radii2D,
+            xyz_gradient_accum, denom, opt_dict, self.spatial_lr_scale) = model_args
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
+        opt_dict['param_groups'] = [g for g in opt_dict['param_groups'] if g.get('name') != 'mask']
         self.optimizer.load_state_dict(opt_dict)
 
     @property
@@ -863,6 +871,7 @@ class GaussianSurfaceThermalModel:
         self._features_rest = nn.Parameter(features[:,:,1:].transpose(1, 2).contiguous().requires_grad_(True))
 
         self._features_thermal_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
+        self._mask = nn.Parameter(torch.ones((self.get_xyz.shape[0], 1), device="cuda").requires_grad_(True))
         self._features_thermal_rest = nn.Parameter(features[:,:,1:].transpose(1, 2).contiguous().requires_grad_(True))
 
         self._scaling = nn.Parameter(scales.requires_grad_(True))
@@ -883,6 +892,7 @@ class GaussianSurfaceThermalModel:
         self._opacity.requires_grad_(True)
         self._features_thermal_dc.requires_grad_(True)
         self._features_thermal_rest.requires_grad_(True)
+        self._mask.requires_grad_(True)
 
         l = [
             {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
@@ -892,7 +902,7 @@ class GaussianSurfaceThermalModel:
             {'params': [self._features_thermal_rest], 'lr': training_args.feature_lr / 20.0, "name": "f_thermal_rest"},
             {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
             {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
-            {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"}
+            {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
         ]
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
@@ -1061,8 +1071,8 @@ class GaussianSurfaceThermalModel:
         for group in self.optimizer.param_groups:
             stored_state = self.optimizer.state.get(group['params'][0], None)
             if stored_state is not None:
-                stored_state["exp_avg"] = stored_state["exp_avg"][mask]
-                stored_state["exp_avg_sq"] = stored_state["exp_avg_sq"][mask]
+                stored_state["exp_avg"] = stored_state["exp_avg"][mask] if stored_state["exp_avg"].shape[0] == mask.shape[0] else stored_state["exp_avg"][mask.unsqueeze(-1).expand_as(stored_state["exp_avg"])]
+                stored_state["exp_avg_sq"] = stored_state["exp_avg_sq"][mask] if stored_state["exp_avg_sq"].shape[0] == mask.shape[0] else stored_state["exp_avg_sq"][mask.unsqueeze(-1).expand_as(stored_state["exp_avg_sq"])]
 
                 del self.optimizer.state[group['params'][0]]
                 group["params"][0] = nn.Parameter((group["params"][0][mask].requires_grad_(True)))
@@ -1086,12 +1096,10 @@ class GaussianSurfaceThermalModel:
         self._features_thermal_rest = optimizable_tensors["f_thermal_rest"]
 
         self._opacity = optimizable_tensors["opacity"]
-
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
-
+        self._mask = nn.Parameter(self._mask[valid_points_mask].detach().requires_grad_(True))
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
-
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
 
@@ -1099,20 +1107,22 @@ class GaussianSurfaceThermalModel:
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
             assert len(group["params"]) == 1
+            if group["name"] not in tensors_dict:
+                continue
             extension_tensor = tensors_dict[group["name"]]
             stored_state = self.optimizer.state.get(group['params'][0], None)
             if stored_state is not None:
 
-                stored_state["exp_avg"] = torch.cat((stored_state["exp_avg"], torch.zeros_like(extension_tensor)), dim=0)
-                stored_state["exp_avg_sq"] = torch.cat((stored_state["exp_avg_sq"], torch.zeros_like(extension_tensor)), dim=0)
+                stored_state["exp_avg"] = torch.cat((stored_state["exp_avg"].cuda(), torch.zeros_like(extension_tensor).cuda()), dim=0)
+                stored_state["exp_avg_sq"] = torch.cat((stored_state["exp_avg_sq"].cuda(), torch.zeros_like(extension_tensor).cuda()), dim=0)
 
                 del self.optimizer.state[group['params'][0]]
-                group["params"][0] = nn.Parameter(torch.cat((group["params"][0], extension_tensor), dim=0).requires_grad_(True))
+                group["params"][0] = nn.Parameter(torch.cat((group["params"][0].cuda(), extension_tensor.cuda()), dim=0).requires_grad_(True))
                 self.optimizer.state[group['params'][0]] = stored_state
 
                 optimizable_tensors[group["name"]] = group["params"][0]
             else:
-                group["params"][0] = nn.Parameter(torch.cat((group["params"][0], extension_tensor), dim=0).requires_grad_(True))
+                group["params"][0] = nn.Parameter(torch.cat((group["params"][0].cuda(), extension_tensor.cuda()), dim=0).requires_grad_(True))
                 optimizable_tensors[group["name"]] = group["params"][0]
 
         return optimizable_tensors
@@ -1125,7 +1135,7 @@ class GaussianSurfaceThermalModel:
         "scaling" : new_scaling,
         "rotation" : new_rotation,
         "f_thermal_dc": new_features_thermal_dc,
-        "f_thermal_rest": new_features_thermal_rest
+        "f_thermal_rest": new_features_thermal_rest,
         }
 
         optimizable_tensors = self.cat_tensors_to_optimizer(d)
@@ -1134,13 +1144,11 @@ class GaussianSurfaceThermalModel:
         self._features_rest = optimizable_tensors["f_rest"]
 
         self._opacity = optimizable_tensors["opacity"]
-
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
-
         self._features_thermal_dc = optimizable_tensors["f_thermal_dc"]
         self._features_thermal_rest = optimizable_tensors["f_thermal_rest"]
-
+        self._mask = nn.Parameter(torch.cat([self._mask.cuda(), torch.ones((new_xyz.shape[0], 1), device="cuda")], dim=0).detach().requires_grad_(True))
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
@@ -1230,7 +1238,12 @@ class GaussianSurfaceThermalModel:
             big_points_vs = self.max_radii2D > max_screen_size
             big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
             prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
+        torch.cuda.empty_cache()
+
+    def mask_prune(self):
+        prune_mask = (torch.sigmoid(self._mask) <= 0.01).squeeze(-1)
         self.prune_points(prune_mask)
+        torch.cuda.empty_cache()
 
 
     def densify_and_prune_split(self, max_grad, min_opacity, extent, max_screen_size, mask):
@@ -1297,6 +1310,7 @@ class GaussianSurfaceThermalModel:
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        self._mask = nn.Parameter(torch.ones((fused_point_cloud.shape[0], 1), device="cuda").requires_grad_(True))
         torch.cuda.empty_cache()
 
     @torch.no_grad()

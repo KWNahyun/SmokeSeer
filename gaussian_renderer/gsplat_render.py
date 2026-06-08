@@ -307,3 +307,52 @@ def render_depth(viewpoint_camera, pc, pipe):
         cov3D_precomp=None,
     )
     return res
+
+
+# ---------------------------------------------------------------------------
+# LightGaussian: importance score rendering
+# (uses compress-diff-gaussian-rasterization CUDA backend)
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def count_render(viewpoint_camera, pc, pipe):
+    """Render with importance score for LightGaussian pruning."""
+    import math as _math, sys as _sys, os as _os
+    _sys.path.insert(0, _os.path.expanduser("~/LightGaussian/submodules/compress-diff-gaussian-rasterization"))
+    from diff_gaussian_rasterization import (
+        GaussianRasterizationSettings, GaussianRasterizer)
+
+    tanfovx = _math.tan(viewpoint_camera.FoVx * 0.5)
+    tanfovy = _math.tan(viewpoint_camera.FoVy * 0.5)
+    raster_settings = GaussianRasterizationSettings(
+        image_height=int(viewpoint_camera.image_height),
+        image_width=int(viewpoint_camera.image_width),
+        tanfovx=tanfovx,
+        tanfovy=tanfovy,
+        bg=torch.zeros(3, device="cuda"),
+        scale_modifier=1.0,
+        viewmatrix=viewpoint_camera.world_view_transform,
+        projmatrix=viewpoint_camera.full_proj_transform,
+        sh_degree=pc.active_sh_degree,
+        campos=viewpoint_camera.camera_center,
+        prefiltered=False,
+        debug=pipe.debug,
+        f_count=True,
+    )
+    rasterizer = GaussianRasterizer(raster_settings=raster_settings)
+    gaussians_count, important_score, rendered_image, radii = rasterizer(
+        means3D=pc.get_xyz,
+        means2D=torch.zeros_like(pc.get_xyz, requires_grad=False),
+        shs=pc.get_features,
+        colors_precomp=None,
+        opacities=pc.get_opacity,
+        scales=pc.get_scaling,
+        rotations=pc.get_rotation,
+        cov3D_precomp=None,
+    )
+    return {
+        "gaussians_count":  gaussians_count,
+        "important_score":  important_score,
+        "render":           rendered_image,
+        "radii":            radii,
+    }

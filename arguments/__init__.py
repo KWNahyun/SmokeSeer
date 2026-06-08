@@ -97,6 +97,8 @@ class OptimizationParams(ParamGroup):
         self.rotation_lr = 0.001
         self.percent_dense = 0.01
         self.lambda_dssim = 0.2
+        self.lambda_mask = 0.01  # Compact-3DGS mask regularization
+        self.mask_prune_iter = 1000  # prune masked gaussians every N iters
         self.densification_interval = 100
         self.opacity_reset_interval = 4500
         self.densify_from_iter = 500
